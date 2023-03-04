@@ -23,10 +23,19 @@ applyJavaNature(
 
 description = "Apache Beam :: SDKs :: Java :: Extensions :: Timeseries"
 
+
+test {
+  systemProperty "log4j.configuration", "log4j-test.properties"
+}
+
 dependencies {
   implementation library.java.vendored_guava_26_0_jre
   implementation library.java.joda_time
   implementation project(path: ":sdks:java:core", configuration: "shadow")
+  implementation 'org.slf4j:slf4j-api:1.7.30'
+
   testImplementation library.java.junit
   testRuntimeOnly project(path: ":runners:direct-java", configuration: "shadow")
+  testRuntimeOnly library.java.slf4j_api
+  testRuntimeOnly library.java.slf4j_jdk14
 }
