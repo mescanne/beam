@@ -54,6 +54,9 @@ public class TickerStreamTest {
 
   public static final Instant START = Instant.parse("2000-01-01T00:00");
 
+  public static final TickerStream<NaiveOrderBook> CONFIG =
+      TickerStream.create(TickerStream.Mode.MULTIPLEX_STREAM, NaiveOrderBook.class);
+
   @Rule public final transient TestPipeline p = TestPipeline.create();
 
   @Test
@@ -72,9 +75,9 @@ public class TickerStreamTest {
     PCollection<KV<Instant, Long>> output =
         ticks.apply(
             ParDo.of(
-                TickerStream.GlobalSequenceTracker.builder()
+                TickerStream.GlobalSeqWM.<NaiveOrderBook>builder()
+                    .setTickerStream(CONFIG)
                     .setBatchSize(Duration.standardSeconds(5))
-                    .setEstimateFirstSeqNumSize(0L)
                     .build()));
 
     PAssert.that(output)
@@ -104,9 +107,9 @@ public class TickerStreamTest {
     PCollection<KV<Instant, Long>> output =
         ticks.apply(
             ParDo.of(
-                TickerStream.GlobalSequenceTracker.builder()
+                TickerStream.GlobalSeqWM.<NaiveOrderBook>builder()
+                    .setTickerStream(CONFIG)
                     .setBatchSize(Duration.standardSeconds(5))
-                    .setEstimateFirstSeqNumSize(0L)
                     .build()));
 
     PAssert.that(output)
@@ -136,9 +139,9 @@ public class TickerStreamTest {
     PCollection<KV<Instant, Long>> output =
         ticks.apply(
             ParDo.of(
-                TickerStream.GlobalSequenceTracker.builder()
+                TickerStream.GlobalSeqWM.<NaiveOrderBook>builder()
+                    .setTickerStream(CONFIG)
                     .setBatchSize(Duration.standardSeconds(5))
-                    .setEstimateFirstSeqNumSize(0L)
                     .build()));
 
     PAssert.that(output)
@@ -198,8 +201,10 @@ public class TickerStreamTest {
             .setCoder(KvCoder.of(StringUtf8Coder.of(), SerializableCoder.of(Tick.class)))
             .apply(
                 ParDo.of(
-                        new TickerStream.PerSymbolSequencer<NaiveOrderBook>(
-                            NaiveOrderBook.class, SerializableCoder.of(NaiveOrderBook.class)))
+                        new TickerStream.SymbolState<NaiveOrderBook>(
+                            TickerStream.create(
+                                TickerStream.Mode.MULTIPLEX_STREAM, NaiveOrderBook.class),
+                            SerializableCoder.of(NaiveOrderBook.class)))
                     .withSideInput(
                         TickerStream.SIDE_INPUT_NAME,
                         p.apply("S2", releaseMessage)
@@ -277,8 +282,10 @@ public class TickerStreamTest {
             .setCoder(KvCoder.of(StringUtf8Coder.of(), SerializableCoder.of(Tick.class)))
             .apply(
                 ParDo.of(
-                        new TickerStream.PerSymbolSequencer<NaiveOrderBook>(
-                            NaiveOrderBook.class, SerializableCoder.of(NaiveOrderBook.class)))
+                        new TickerStream.SymbolState<NaiveOrderBook>(
+                            TickerStream.create(
+                                TickerStream.Mode.MULTIPLEX_STREAM, NaiveOrderBook.class),
+                            SerializableCoder.of(NaiveOrderBook.class)))
                     .withSideInput(
                         "GlobalSeqWM",
                         p.apply("S2", releaseMessage)
@@ -334,9 +341,9 @@ public class TickerStreamTest {
     PCollection<KV<Instant, Long>> output =
         ticks.apply(
             ParDo.of(
-                TickerStream.GlobalSequenceTracker.builder()
+                TickerStream.GlobalSeqWM.<NaiveOrderBook>builder()
+                    .setTickerStream(CONFIG)
                     .setBatchSize(Duration.standardSeconds(5))
-                    .setEstimateFirstSeqNumSize(Long.MAX_VALUE - 5)
                     .build()));
 
     PAssert.that(output)

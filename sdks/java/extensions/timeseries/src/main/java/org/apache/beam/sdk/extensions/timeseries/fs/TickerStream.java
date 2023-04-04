@@ -50,6 +50,7 @@ import org.apache.beam.sdk.transforms.windowing.AfterProcessingTime;
 import org.apache.beam.sdk.transforms.windowing.GlobalWindows;
 import org.apache.beam.sdk.transforms.windowing.Repeatedly;
 import org.apache.beam.sdk.transforms.windowing.Window;
+import org.apache.beam.sdk.util.Preconditions;
 import org.apache.beam.sdk.values.KV;
 import org.apache.beam.sdk.values.PCollection;
 import org.apache.beam.sdk.values.PCollectionView;
@@ -67,8 +68,35 @@ import org.slf4j.LoggerFactory;
  * sequence is a monotonically increasing value. Data will include an id that identifies an
  * instrument.
  *
- * <p>TODO Add start seqnum logic, right now min(first window) becomes start seqnum TODO Objects for
- * the G
+ * <p>Multiplex mode is where symbols come with a GlobalSequenceId and can have many symbols
+ *
+ * <p>[(0, G), (1,A), (2,G), (3,G), (4,A)]
+ *
+ * <p>Simplex is where each symbol comes with its own Sequence ID. This mode is NOT IMPLEMENTED [(0,
+ * G), (0,A), (1,G), (2,G), (1,A)]
+ *
+ * <p>Multiplex Mode:
+ *
+ * <p>This impl makes use of event time timers to sync the release of values per symbol based on the
+ * data seen from the GlobalSequence. Sequence is expected to be monotonically increasing by a known
+ * value at each step.
+ *
+ * <OL>
+ *   TODO : Currently we assume SeqNow-SeqPrev = 1, add lambda
+ *   <p>TODO : Add start seqnum logic, right now min(first window) becomes start seqnum
+ *   <p>TODO : Objects for the G * TODO : Detect size of OrderBook object, the maximum size of this
+ *   object in state is runner dependent
+ * </OL>
+ *
+ * Note this impl assumes the GlobalSeq will not be larger than {Long.Max}
+ *
+ * <p>An internal Batch length in seconds dictates the maximum frequency by which the Sync call is
+ * pushed. The push is in the format of a SideInput which is sent to all symbol-state machines. Each
+ * symbol-state will hold values in an {OrderedListState} until the release signal.
+ *
+ * <p>Note the system will halt processing if a global sequence gap is detected.
+ *
+ * <p>Note currently the windowing strategy of the PCollection into the transform is not preserved.
  */
 @AutoValue
 @Experimental
@@ -76,27 +104,38 @@ import org.slf4j.LoggerFactory;
 public abstract class TickerStream<V extends OrderBook>
     extends PTransform<PCollection<Tick>, PCollection<V>> {
 
-  //  private final static Logger LOG = LoggerFactory.getLogger(TickerStream.class);
-
   public abstract Mode getMode();
 
-  public abstract Class<V> getClazz();
+  public abstract Class<V> getOrderBookClazz();
+
+  @Nullable
+  public abstract Long getEstimateFirstSeqNumSize();
 
   public static <V extends OrderBook> TickerStream<V> create(Mode mode, Class<V> clazz) {
-    return new AutoValue_TickerStream.Builder<V>().setMode(mode).setClazz(clazz).build();
+
+    Preconditions.checkArgumentNotNull(mode, " Mode must be set.");
+    Preconditions.checkArgumentNotNull(clazz, " Class of Order Book must be set. Generics eh...");
+
+    assert !mode.equals(Mode.SIMPLEX_STREAM);
+
+    return new AutoValue_TickerStream.Builder<V>().setMode(mode).setOrderBookClazz(clazz).build();
   }
 
   @AutoValue.Builder
   public abstract static class Builder<V extends OrderBook> {
     public abstract Builder<V> setMode(Mode value);
 
-    public abstract Builder<V> setClazz(Class<V> value);
+    public abstract Builder<V> setOrderBookClazz(Class<V> value);
+
+    public abstract Builder<V> setEstimateFirstSeqNumSize(Long value);
 
     public abstract TickerStream<V> build();
   }
 
+  // This value dictates how often the Sync event is broadcast
   static final Duration BATCH_DURATION = Duration.standardSeconds(5);
 
+  // Stable name for the SIDE INPUT which is also used directly in Unit tests
   static final String SIDE_INPUT_NAME = "GlobalSeqWM";
 
   /** Storing window strategy of incoming stream, to allow reapplication post transform. */
@@ -113,21 +152,21 @@ public abstract class TickerStream<V extends OrderBook>
   @Override
   public PCollection<V> expand(PCollection<Tick> input) {
 
+    // TODO reset window strategy
     setIncomingWindowStrategy(input.getWindowingStrategy());
 
+    // TODO Create Validation Transform, check seq id is set etc..
     // TODO Reduce byte[] to the single thread
     // This step will push all values to a single thread for processing of the GlobalTicks
-
-    // Strip out extra bytes
-    //    PCollection<Row> rows = input.apply(Convert.toRows());
+    // TODO Behaviour of an Iterable is that it will grow forever, this will eventually fail / OOM
+    // Need to switch to Singleton
 
     PCollectionView<Iterable<KV<Instant, Long>>> i =
         input
             .apply(
-                "Win1",
+                "ApplyGlobalWindow",
                 Window.<Tick>into(new GlobalWindows())
                     .triggering(Repeatedly.forever(AfterProcessingTime.pastFirstElementInPane()))
-                    .withAllowedLateness(Duration.ZERO)
                     .discardingFiredPanes())
             .apply(
                 "MapToKV<1,Tick>",
@@ -135,20 +174,24 @@ public abstract class TickerStream<V extends OrderBook>
                         TypeDescriptors.kvs(TypeDescriptors.integers(), TypeDescriptors.longs()))
                     .via(x -> KV.of(1, x.getGlobalSequence())))
             .apply(
+                "TrackGlobalSequence",
                 ParDo.of(
-                    GlobalSequenceTracker.builder()
+                    GlobalSeqWM.<V>builder()
+                        .setTickerStream(this)
                         .setBatchSize(TickerStream.BATCH_DURATION)
-                        .setEstimateFirstSeqNumSize(0L)
                         .build()))
             .apply(View.asIterable());
 
-    Coder<V> ob = null;
+    Coder<V> orderBookCoder = null;
 
+    // This will fail at Pipeline creation time.
     try {
-      ob = input.getPipeline().getCoderRegistry().getCoder(getClazz());
+      orderBookCoder = input.getPipeline().getCoderRegistry().getCoder(getOrderBookClazz());
     } catch (CannotProvideCoderException e) {
       throw new RuntimeException(e);
     }
+
+    // This is the main path, with Ticks waiting in state until cleared.
 
     return input
         .apply(
@@ -156,154 +199,161 @@ public abstract class TickerStream<V extends OrderBook>
             MapElements.into(
                     TypeDescriptors.kvs(TypeDescriptors.strings(), TypeDescriptor.of(Tick.class)))
                 .via(x -> KV.of(x.id, x)))
-        .apply(ParDo.of(new PerSymbolSequencer<V>(getClazz(), ob)).withSideInput("GlobalSeqWM", i))
-        .setCoder(ob);
+        .apply(
+            ParDo.of(new SymbolState<V>(this, orderBookCoder))
+                .withSideInput(TickerStream.SIDE_INPUT_NAME, i))
+        .setCoder(orderBookCoder);
   }
 
-  /** TODO Work with AutoValue and StateSpec where Coder is passed in. */
-  public static class PerSymbolSequencer<T extends OrderBook> extends DoFn<KV<String, Tick>, T> {
+  /**
+   * Per Symbol State, holding value until a SideInput signal to release up to a GlobalSequenceNum.
+   *
+   * <p>Input signal is {KV<Instant,Long>} which is a range of [0, LongValue)
+   */
+  public static class SymbolState<T extends OrderBook> extends DoFn<KV<String, Tick>, T> {
 
-    private static final Logger LOG = LoggerFactory.getLogger(PerSymbolSequencer.class);
+    // Config
+    private TickerStream<T> tickerStream;
 
-    private final Class<T> clazz;
+    private static final Logger LOG = LoggerFactory.getLogger(SymbolState.class);
 
-    PerSymbolSequencer(Class<T> clazz, Coder<T> stateStateSpec) {
+    SymbolState(TickerStream<T> tickerStream, Coder<T> stateStateSpec) {
+      this.tickerStream = tickerStream;
       orderBook = StateSpecs.value(stateStateSpec);
-      this.clazz = clazz;
-      assert this.clazz != null;
     }
 
+    // Buffers Ticks until we get signal to release
     @DoFn.StateId("buffer")
     @SuppressWarnings("unused")
-    private final StateSpec<OrderedListState<Tick>> bufferedEvents =
+    private final StateSpec<OrderedListState<Tick>> buffer =
         StateSpecs.orderedList(SerializableCoder.of(Tick.class));
 
-    @DoFn.StateId("releaseSignals")
+    // SideInput used to store the release signals
+    @DoFn.StateId("seqWMs")
     @SuppressWarnings("unused")
-    private final StateSpec<MapState<Instant, Long>> releaseSignals =
+    private final StateSpec<MapState<Instant, Long>> seqWMs =
         StateSpecs.map(InstantCoder.of(), VarLongCoder.of());
 
+    // Order book object stored as Singleton
     @SuppressWarnings("unused")
-    @DoFn.StateId("orderbook")
+    @DoFn.StateId("orderBook")
     private final StateSpec<ValueState<T>> orderBook;
 
-    @TimerFamily("mutateOrderBook")
+    @TimerFamily("mutate")
     @SuppressWarnings("unused")
     private final TimerSpec expirySpec = TimerSpecs.timerMap(TimeDomain.EVENT_TIME);
 
     @ProcessElement
     public void process(
-        @SideInput("GlobalSeqWM") Iterable<KV<Instant, Long>> maxSeqRelease,
-        @StateId("releaseSignals") MapState<Instant, Long> releaseSignals,
+        @SideInput(TickerStream.SIDE_INPUT_NAME) Iterable<KV<Instant, Long>> seqWM,
+        @StateId("seqWMs") MapState<Instant, Long> releaseSignals,
         @StateId("buffer") OrderedListState<Tick> buffer,
-        @TimerFamily("mutateOrderBook") TimerMap expiryTimers,
+        @TimerFamily("mutate") TimerMap expiryTimers,
         @Timestamp Instant instant,
         @Element KV<String, Tick> tick) {
 
+      // Validation of Ticks will prevent error here
       long sequence = tick.getValue().getGlobalSequence();
 
       // Add elements to OrderedList, we do not do any processing @Process only in the EventTimer
       buffer.add(TimestampedValue.of(tick.getValue(), Instant.ofEpochMilli(sequence)));
-      Iterator<KV<Instant, Long>> i = maxSeqRelease.iterator();
+      Iterator<KV<Instant, Long>> i = seqWM.iterator();
       while (i.hasNext()) {
         KV<Instant, Long> k = i.next();
         releaseSignals.put(k.getKey(), k.getValue());
         // Set timer for Release time
         expiryTimers.set(String.valueOf(k.getKey().getMillis()), k.getKey());
-        LOG.info("Setting Release Timers in key {} to {}", tick.getKey(), k.getKey());
+        LOG.trace("Setting Release Timers in key {} to {}", tick.getKey(), k.getKey());
       }
     }
 
-    @OnTimerFamily("mutateOrderBook")
+    @OnTimerFamily("mutate")
     public void onExpiry(
         OutputReceiver<T> context,
         OnTimerContext timerContext,
-        @StateId("releaseSignals") MapState<Instant, Long> releaseSignals,
-        @StateId("orderbook") ValueState<T> orderBookState,
+        @StateId("seqWMs") MapState<Instant, Long> seqWMs,
+        @StateId("orderBook") ValueState<T> orderBookState,
         @StateId("buffer") OrderedListState<Tick> buffer) {
 
-      // TODO making assumption that the sequence starts from a positive number that is increasing
-      // -1 is magic number which indicates this is the first ever value
-      long releaseSignal =
-          Optional.ofNullable(releaseSignals.get(timerContext.timestamp()).read()).orElse(0L);
+      // This should never be null, we can only be here if a value was set
+      long releaseSignal = seqWMs.get(timerContext.timestamp()).read();
 
-      LOG.info(
+      LOG.trace(
           "OnTimer Time {} release {} batch {}",
           timerContext.timestamp(),
           releaseSignal,
           buffer.isEmpty().read());
 
-      if (!buffer.isEmpty().read()) {
+      if (Boolean.FALSE.equals(buffer.isEmpty().read())) {
         Iterable<TimestampedValue<Tick>> batch =
             buffer.readRange(Instant.EPOCH, Instant.ofEpochMilli(releaseSignal));
 
-        Iterator<TimestampedValue<Tick>> batchItr = batch.iterator();
         T orderBook;
 
         try {
           orderBook =
               Optional.ofNullable(orderBookState.read())
-                  .orElse(clazz.getDeclaredConstructor().newInstance());
+                  .orElse(tickerStream.getOrderBookClazz().getDeclaredConstructor().newInstance());
         } catch (Exception e) {
           throw new RuntimeException(e);
         }
 
         int count = 0;
-        while (batchItr.hasNext()) {
-          Tick tick = batchItr.next().getValue();
+        for (TimestampedValue<Tick> tickTimestampedValue : batch) {
+          Tick tick = tickTimestampedValue.getValue();
           orderBook.add(tick.getOrder());
           count++;
         }
 
         if (count > 0) {
-          LOG.info("Outputting Order Book {} {}", timerContext.timestamp(), orderBook.getAsks());
+          LOG.trace("Outputting Order Book {} {}", timerContext.timestamp(), orderBook.getAsks());
           context.outputWithTimestamp(orderBook, timerContext.timestamp());
           orderBookState.write(orderBook);
         }
 
+        // Note Range is [0, releaseSignal)
         buffer.clearRange(Instant.EPOCH, Instant.ofEpochMilli(releaseSignal));
         // Clear TimerMapValue
-        releaseSignals.remove(timerContext.timestamp());
+        seqWMs.remove(timerContext.timestamp());
       }
     }
   }
 
   @AutoValue
-  public abstract static class GlobalSequenceTracker
+  public abstract static class GlobalSeqWM<T extends OrderBook>
       extends DoFn<KV<Integer, Long>, KV<Instant, Long>> {
 
-    private static final Logger LOG = LoggerFactory.getLogger(GlobalSequenceTracker.class);
+    private static final Logger LOG = LoggerFactory.getLogger(GlobalSeqWM.class);
+
+    public abstract TickerStream<T> getTickerStream();
 
     public abstract Duration getBatchSize();
 
-    public abstract Long getEstimateFirstSeqNumSize();
-
-    public static GlobalSequenceTracker.Builder builder() {
-      return new AutoValue_TickerStream_GlobalSequenceTracker.Builder();
+    public static <T extends OrderBook> GlobalSeqWM.Builder<T> builder() {
+      return new AutoValue_TickerStream_GlobalSeqWM.Builder<T>();
     }
 
     @AutoValue.Builder
-    public abstract static class Builder {
-      public abstract Builder setBatchSize(Duration value);
+    public abstract static class Builder<T extends OrderBook> {
+      public abstract Builder<T> setTickerStream(TickerStream<T> value);
 
-      public abstract Builder setEstimateFirstSeqNumSize(Long value);
+      public abstract Builder<T> setBatchSize(Duration value);
 
-      public abstract GlobalSequenceTracker build();
+      public abstract GlobalSeqWM<T> build();
     }
 
     @DoFn.StateId("buffer")
     @SuppressWarnings("unused")
-    private final StateSpec<OrderedListState<TimestampedValue<Long>>> bufferedEvents =
+    private final StateSpec<OrderedListState<TimestampedValue<Long>>> buffer =
         StateSpecs.orderedList(TimestampedValue.TimestampedValueCoder.of(VarLongCoder.of()));
 
     @DoFn.StateId("timerSet")
     @SuppressWarnings("unused")
     private final StateSpec<ValueState<Boolean>> timerState = StateSpecs.value(BooleanCoder.of());
 
-    @StateId("internWaterMark")
+    @StateId("seqWaterMark")
     @SuppressWarnings("unused")
-    private final StateSpec<ValueState<Long>> internalWaterMark =
-        StateSpecs.value(VarLongCoder.of());
+    private final StateSpec<ValueState<Long>> seqWaterMark = StateSpecs.value(VarLongCoder.of());
 
     @StateId("maxSequence")
     @SuppressWarnings("unused")
@@ -315,9 +365,9 @@ public abstract class TickerStream<V extends OrderBook>
     private final StateSpec<CombiningState<Long, long[], Long>> minSequence =
         StateSpecs.combining(Min.ofLongs());
 
-    @TimerId("expiry")
+    @TimerId("onTimer")
     @SuppressWarnings("unused")
-    private final TimerSpec expirySpec = TimerSpecs.timer(TimeDomain.EVENT_TIME);
+    private final TimerSpec onTimer = TimerSpecs.timer(TimeDomain.EVENT_TIME);
 
     @ProcessElement
     public void process(
@@ -325,8 +375,8 @@ public abstract class TickerStream<V extends OrderBook>
         @StateId("timerSet") ValueState<Boolean> isTimerSet,
         @StateId("maxSequence") CombiningState<Long, long[], Long> maxSequence,
         @StateId("minSequence") CombiningState<Long, long[], Long> minSequence,
-        @TimerId("expiry") Timer expiryTimer,
-        @Timestamp Instant instant,
+        @TimerId("onTimer") Timer expiryTimer,
+        @Timestamp Instant eventTime,
         @Element KV<Integer, Long> globalSeq) {
 
       long sequence = globalSeq.getValue();
@@ -336,103 +386,95 @@ public abstract class TickerStream<V extends OrderBook>
       // Add elements to OrderedList, we do not do any processing @Process only in the EventTimer
       buffer.add(
           TimestampedValue.of(
-              TimestampedValue.of(globalSeq.getValue(), instant), Instant.ofEpochMilli(sequence)));
+              TimestampedValue.of(globalSeq.getValue(), eventTime),
+              Instant.ofEpochMilli(sequence)));
 
       if (!Optional.ofNullable(isTimerSet.read()).orElse(false)) {
         expiryTimer
-            .withOutputTimestamp(instant.plus(getBatchSize()))
-            .set(instant.plus(getBatchSize()));
+            .withOutputTimestamp(eventTime.plus(getBatchSize()))
+            .set(eventTime.plus(getBatchSize()));
         isTimerSet.write(true);
-        LOG.info("Setting Timers to {}", instant.plus(getBatchSize()));
+        LOG.trace("Setting Timers to {}", eventTime.plus(getBatchSize()));
       }
     }
 
-    @OnTimer("expiry")
-    public void sequenceRelease(
+    @OnTimer("onTimer")
+    public void onTimer(
         OutputReceiver<KV<Instant, Long>> context,
         OnTimerContext timerContext,
-        @StateId("internWaterMark") ValueState<Long> internalWaterMarkState,
+        @StateId("seqWaterMark") ValueState<Long> seqWaterMarkState,
         @StateId("buffer") OrderedListState<TimestampedValue<Long>> buffer,
         @StateId("maxSequence") CombiningState<Long, long[], Long> maxSequence,
-        @StateId("minSequence") CombiningState<Long, long[], Long> minSequence,
+        @StateId("minSequence") CombiningState<Long, long[], Long> minSeq,
         @StateId("timerSet") ValueState<Boolean> isTimerSet,
-        @TimerId("expiry") Timer expiryTimer) {
+        @TimerId("onTimer") Timer timer) {
 
       // TODO making assumption that the sequence starts from a positive number that is increasing
       // -1 is magic number which indicates this is the first ever value
-      long internalWaterMark = Optional.ofNullable(internalWaterMarkState.read()).orElse(-1L);
-      Instant endRead = Instant.ofEpochMilli(internalWaterMark + getBatchSize().getMillis());
+      long seqWM = Optional.ofNullable(seqWaterMarkState.read()).orElse(-1L);
+      Instant endRead = Instant.ofEpochMilli(seqWM + getBatchSize().getMillis());
       // If internalWaterMark is -1 then we are in startup mode
-      if (internalWaterMark == -1) {
-        // We have to page through the list buffer, as we are mapping globalsequence onto timestamp,
+      if (seqWM == -1) {
+        // We have to page through the list buffer, as we are mapping global seq onto timestamp,
         // find
         // min value
-        Instant readSize =
-            Instant.ofEpochMilli(
-                Optional.ofNullable(minSequence.read()).orElse(0L) + getBatchSize().getMillis());
+        Instant readSize = Instant.ofEpochMilli(minSeq.read() + getBatchSize().getMillis());
         endRead = readSize.isAfter(endRead) ? readSize : endRead;
       }
-      minSequence.clear();
+      minSeq.clear();
 
-      if (!buffer.isEmpty().read()) {
+      if (Boolean.FALSE.equals(buffer.isEmpty().read())) {
 
         Iterable<TimestampedValue<TimestampedValue<Long>>> batch =
-            buffer.readRange(
-                Instant.ofEpochMilli(internalWaterMark == -1 ? 0 : internalWaterMark), endRead);
+            buffer.readRange(Instant.ofEpochMilli(seqWM == -1 ? 0 : seqWM), endRead);
 
         Iterator<TimestampedValue<TimestampedValue<Long>>> batchItr = batch.iterator();
 
-        boolean npGapDetected = true;
-        long lastSequence = internalWaterMark;
+        boolean noGap = true;
+        long lastSeq = seqWM;
 
-        while (npGapDetected && batchItr.hasNext()) {
+        while (noGap && batchItr.hasNext()) {
 
           // Recall timestamp here is just a proxy for sequence number
           TimestampedValue<TimestampedValue<Long>> current = batchItr.next();
-          long nextSequence = current.getTimestamp().getMillis();
-
-          //                    LOG.info("next {}, last {} ", nextSequence, lastSequence);
+          long nextSeq = current.getTimestamp().getMillis();
 
           if ((current.getValue().getTimestamp().isBefore(timerContext.timestamp()))
-              && (lastSequence == -1 || (nextSequence - lastSequence) == 1)) {
-            lastSequence = nextSequence;
+              && (lastSeq == -1 || (nextSeq - lastSeq) == 1)) {
+            lastSeq = nextSeq;
 
           } else {
-            npGapDetected = false;
+            noGap = false;
           }
         }
 
-        if (lastSequence != internalWaterMark) {
-          context.output(KV.of(timerContext.timestamp(), lastSequence + 1));
+        if (lastSeq != seqWM) {
+          context.output(KV.of(timerContext.timestamp(), lastSeq + 1));
         }
 
         buffer.clearRange(
-            Instant.ofEpochMilli(internalWaterMark == -1 ? 0 : internalWaterMark),
-            Instant.ofEpochMilli(lastSequence + 1));
+            Instant.ofEpochMilli(seqWM == -1 ? 0 : seqWM), Instant.ofEpochMilli(lastSeq + 1));
 
         // Update our internal watermark to be the last good sequence
-        internalWaterMarkState.write(lastSequence);
+        seqWaterMarkState.write(lastSeq);
 
         // Are we at the end of our BagState
 
-        if (buffer.isEmpty().read().booleanValue()
-            && (lastSequence == maxSequence.read().longValue())) {
+        if (Boolean.TRUE.equals(buffer.isEmpty().read()) && (lastSeq == maxSequence.read())) {
           // Then we unset the timerIsSet Value
           isTimerSet.write(false);
         } else {
-          // We need to set a timer for 5 sec from now
-          expiryTimer
+          // We need to set a timer for n sec from now
+          timer
               .withOutputTimestamp(timerContext.timestamp().plus(getBatchSize()))
               .set(timerContext.timestamp().plus(getBatchSize()));
-          //          LOG.info("Setting loop Timers to {}",
-          // timerContext.timestamp().plus(getBatchSize()));
         }
       }
     }
   }
 
   enum Mode {
-    SINGLE_STREAM,
+    SIMPLEX_STREAM,
     MULTIPLEX_STREAM
   }
 }
