@@ -15,7 +15,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package org.apache.beam.sdk.extensions.timeseries.fs;
+package org.apache.beam.sdk.extensions.timeseries.fs.example;
 
 import java.io.Serializable;
 import java.util.ArrayList;
@@ -28,6 +28,7 @@ import java.util.Optional;
 import java.util.TreeMap;
 import javax.annotation.Nullable;
 import org.apache.beam.sdk.annotations.Experimental;
+import org.apache.beam.sdk.extensions.timeseries.fs.MutableState;
 
 /**
  * Naive implementation of an order book object used for testing purposes.
@@ -38,10 +39,10 @@ import org.apache.beam.sdk.annotations.Experimental;
  * <p>TODO remove java serializable as coder
  */
 @Experimental
-public class NaiveOrderBook extends OrderBook implements Serializable {
+public class NaiveOrderBook extends OrderBook<Tick> implements Serializable {
   // TODO figure out how to avoid NullChecker errors for Order.id AutoValue Not Nullable property
-  TreeMap<Double, Map<String, Order>> bids = new TreeMap<>(Comparator.reverseOrder());
-  TreeMap<Double, Map<String, Order>> asks = new TreeMap<>();
+  public TreeMap<Double, Map<String, Order>> bids = new TreeMap<>(Comparator.reverseOrder());
+  public TreeMap<Double, Map<String, Order>> asks = new TreeMap<>();
 
   @Override
   public NaiveOrderBook add(Order order) {
@@ -87,7 +88,7 @@ public class NaiveOrderBook extends OrderBook implements Serializable {
   }
 
   @Override
-  public OrderBook append(Tick tick) {
+  public MutableState<Tick> append(Tick tick) {
     return this;
   }
 
@@ -113,5 +114,10 @@ public class NaiveOrderBook extends OrderBook implements Serializable {
 
   private TreeMap<Double, Map<String, Order>> getTree(Boolean isBid) {
     return isBid ? bids : asks;
+  }
+
+  @Override
+  public void mutate(Tick mutation) {
+    Optional.ofNullable(mutation.getOrder()).ifPresent(this::add);
   }
 }

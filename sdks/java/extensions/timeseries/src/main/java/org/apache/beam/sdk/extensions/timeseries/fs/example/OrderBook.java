@@ -15,21 +15,20 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package org.apache.beam.sdk.extensions.timeseries.fs;
+package org.apache.beam.sdk.extensions.timeseries.fs.example;
 
 import java.util.List;
-import org.apache.beam.sdk.annotations.Experimental;
+import org.apache.beam.sdk.extensions.timeseries.fs.MutableState;
 
-@Experimental
-public abstract class OrderBook {
+public abstract class OrderBook<T> extends MutableState<T> {
 
-  public abstract OrderBook add(Order order);
+  public abstract MutableState<T> append(Tick tick);
 
-  public abstract OrderBook cancel(Order order);
+  public abstract MutableState<T> add(Order order);
 
-  public abstract OrderBook modify(Order originalOrder, Order newOrder);
+  public abstract MutableState<T> cancel(Order order);
+
+  public abstract MutableState<T> modify(Order originalOrder, Order newOrder);
 
   public abstract List<Order> getAsks();
-
-  public abstract OrderBook append(Tick tick);
 }

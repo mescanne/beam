@@ -22,6 +22,8 @@ import java.util.HashMap;
 import java.util.Map;
 import java.util.Optional;
 import java.util.TreeMap;
+import org.apache.beam.sdk.extensions.timeseries.fs.example.NaiveOrderBook;
+import org.apache.beam.sdk.extensions.timeseries.fs.example.Order;
 import org.junit.Assert;
 import org.junit.Test;
 import org.junit.runner.RunWith;

@@ -23,6 +23,9 @@ import org.apache.beam.sdk.coders.SerializableCoder;
 import org.apache.beam.sdk.coders.StringUtf8Coder;
 import org.apache.beam.sdk.coders.VarIntCoder;
 import org.apache.beam.sdk.coders.VarLongCoder;
+import org.apache.beam.sdk.extensions.timeseries.fs.example.NaiveOrderBook;
+import org.apache.beam.sdk.extensions.timeseries.fs.example.Order;
+import org.apache.beam.sdk.extensions.timeseries.fs.example.Tick;
 import org.apache.beam.sdk.schemas.NoSuchSchemaException;
 import org.apache.beam.sdk.testing.PAssert;
 import org.apache.beam.sdk.testing.TestPipeline;
@@ -54,8 +57,11 @@ public class TickerStreamTest {
 
   public static final Instant START = Instant.parse("2000-01-01T00:00");
 
-  public static final TickerStream<NaiveOrderBook> CONFIG =
-      TickerStream.create(TickerStream.Mode.MULTIPLEX_STREAM, NaiveOrderBook.class);
+  public static final TickerStream<Tick, NaiveOrderBook> CONFIG =
+      TickerStream.create(
+          TickerStream.Mode.MULTIPLEX_STREAM,
+          NaiveOrderBook.class,
+          SerializableCoder.of(Tick.class));
 
   @Rule public final transient TestPipeline p = TestPipeline.create();
 
@@ -73,12 +79,7 @@ public class TickerStreamTest {
         p.apply(stream.advanceWatermarkToInfinity()).apply(WithKeys.of(1));
 
     PCollection<KV<Instant, Long>> output =
-        ticks.apply(
-            ParDo.of(
-                TickerStream.GlobalSeqWM.<NaiveOrderBook>builder()
-                    .setTickerStream(CONFIG)
-                    .setBatchSize(Duration.standardSeconds(5))
-                    .build()));
+        ticks.apply(ParDo.of(new TickerStream.GlobalSeqWM(Duration.standardSeconds(5))));
 
     PAssert.that(output)
         .containsInAnyOrder(
@@ -105,12 +106,7 @@ public class TickerStreamTest {
     PCollection<KV<Integer, Long>> ticks = p.apply(stream);
 
     PCollection<KV<Instant, Long>> output =
-        ticks.apply(
-            ParDo.of(
-                TickerStream.GlobalSeqWM.<NaiveOrderBook>builder()
-                    .setTickerStream(CONFIG)
-                    .setBatchSize(Duration.standardSeconds(5))
-                    .build()));
+        ticks.apply(ParDo.of(new TickerStream.GlobalSeqWM(Duration.standardSeconds(5))));
 
     PAssert.that(output)
         .containsInAnyOrder(
@@ -121,7 +117,7 @@ public class TickerStreamTest {
   }
 
   @Test
-  public void nonZeroSTARTValue() throws NoSuchSchemaException {
+  public void nonZeroSTARTValue() {
 
     TestStream<KV<Integer, Long>> stream =
         TestStream.create(KvCoder.of(VarIntCoder.of(), VarLongCoder.of()))
@@ -137,12 +133,7 @@ public class TickerStreamTest {
     PCollection<KV<Integer, Long>> ticks = p.apply(stream);
 
     PCollection<KV<Instant, Long>> output =
-        ticks.apply(
-            ParDo.of(
-                TickerStream.GlobalSeqWM.<NaiveOrderBook>builder()
-                    .setTickerStream(CONFIG)
-                    .setBatchSize(Duration.standardSeconds(5))
-                    .build()));
+        ticks.apply(ParDo.of(new TickerStream.GlobalSeqWM(Duration.standardSeconds(5))));
 
     PAssert.that(output)
         .containsInAnyOrder(
@@ -197,14 +188,11 @@ public class TickerStreamTest {
 
     PCollection<NaiveOrderBook> o =
         p.apply("S1", stream)
-            .apply(WithKeys.<String, Tick>of(x -> x.getId()))
-            .setCoder(KvCoder.of(StringUtf8Coder.of(), SerializableCoder.of(Tick.class)))
+            .apply(ParDo.of(new GenerateKeys()))
             .apply(
                 ParDo.of(
-                        new TickerStream.SymbolState<NaiveOrderBook>(
-                            TickerStream.create(
-                                TickerStream.Mode.MULTIPLEX_STREAM, NaiveOrderBook.class),
-                            SerializableCoder.of(NaiveOrderBook.class)))
+                        new TickerStream.SymbolState<>(
+                            CONFIG, SerializableCoder.of(NaiveOrderBook.class)))
                     .withSideInput(
                         TickerStream.SIDE_INPUT_NAME,
                         p.apply("S2", releaseMessage)
@@ -278,14 +266,11 @@ public class TickerStreamTest {
 
     PCollection<NaiveOrderBook> o =
         p.apply("S1", stream)
-            .apply(WithKeys.<String, Tick>of(x -> x.getId()))
-            .setCoder(KvCoder.of(StringUtf8Coder.of(), SerializableCoder.of(Tick.class)))
+            .apply(ParDo.of(new GenerateKeys()))
             .apply(
                 ParDo.of(
-                        new TickerStream.SymbolState<NaiveOrderBook>(
-                            TickerStream.create(
-                                TickerStream.Mode.MULTIPLEX_STREAM, NaiveOrderBook.class),
-                            SerializableCoder.of(NaiveOrderBook.class)))
+                        new TickerStream.SymbolState<>(
+                            CONFIG, SerializableCoder.of(NaiveOrderBook.class)))
                     .withSideInput(
                         "GlobalSeqWM",
                         p.apply("S2", releaseMessage)
@@ -339,12 +324,7 @@ public class TickerStreamTest {
     PCollection<KV<Integer, Long>> ticks = p.apply(stream);
 
     PCollection<KV<Instant, Long>> output =
-        ticks.apply(
-            ParDo.of(
-                TickerStream.GlobalSeqWM.<NaiveOrderBook>builder()
-                    .setTickerStream(CONFIG)
-                    .setBatchSize(Duration.standardSeconds(5))
-                    .build()));
+        ticks.apply(ParDo.of(new TickerStream.GlobalSeqWM(Duration.standardSeconds(5))));
 
     PAssert.that(output)
         .containsInAnyOrder(
@@ -357,26 +337,41 @@ public class TickerStreamTest {
   @Test
   public void endToEndTest() {
 
-    Tick t0 =
-        new Tick()
-            .setGlobalSequence(0L)
-            .setId("G")
-            .setOrder(new Order("G", 1.0, false, Order.TYPE.ADD));
+    KV<Long, KV<String, Tick>> t0 =
+        KV.of(
+            0L,
+            KV.of(
+                "G",
+                new Tick()
+                    .setGlobalSequence(0L)
+                    .setId("G")
+                    .setOrder(new Order("G", 1.0, false, Order.TYPE.ADD))));
 
-    Tick t1 =
-        new Tick()
-            .setGlobalSequence(1L)
-            .setId("G")
-            .setOrder(new Order("G", 2.0, false, Order.TYPE.ADD));
+    KV<Long, KV<String, Tick>> t1 =
+        KV.of(
+            1L,
+            KV.of(
+                "G",
+                new Tick()
+                    .setGlobalSequence(1L)
+                    .setId("G")
+                    .setOrder(new Order("G", 2.0, false, Order.TYPE.ADD))));
 
-    Tick t2 =
-        new Tick()
-            .setGlobalSequence(2L)
-            .setId("G")
-            .setOrder(new Order("G", 3.0, false, Order.TYPE.ADD));
+    KV<Long, KV<String, Tick>> t2 =
+        KV.of(
+            2L,
+            KV.of(
+                "G",
+                new Tick()
+                    .setGlobalSequence(2L)
+                    .setId("G")
+                    .setOrder(new Order("G", 3.0, false, Order.TYPE.ADD))));
 
-    TestStream<Tick> stream =
-        TestStream.create(SerializableCoder.of(Tick.class))
+    TestStream<KV<Long, KV<String, Tick>>> stream =
+        TestStream.create(
+                KvCoder.of(
+                    VarLongCoder.of(),
+                    KvCoder.of(StringUtf8Coder.of(), SerializableCoder.of(Tick.class))))
             .advanceWatermarkTo(START)
             .addElements(t0)
             .advanceWatermarkTo(START.plus(Duration.standardSeconds(5)))
@@ -387,15 +382,18 @@ public class TickerStreamTest {
 
     NaiveOrderBook book0 = new NaiveOrderBook();
 
-    book0.add(t0.getOrder());
+    book0.add(t0.getValue().getValue().getOrder());
 
     NaiveOrderBook book1 = new NaiveOrderBook();
 
-    book1.add(t0.getOrder()).add(t1.getOrder());
+    book1.add(t0.getValue().getValue().getOrder()).add(t1.getValue().getValue().getOrder());
 
     NaiveOrderBook book2 = new NaiveOrderBook();
 
-    book2.add(t0.getOrder()).add(t1.getOrder()).add(t2.getOrder());
+    book2
+        .add(t0.getValue().getValue().getOrder())
+        .add(t1.getValue().getValue().getOrder())
+        .add(t2.getValue().getValue().getOrder());
 
     SerializableCoder<NaiveOrderBook> coder = SerializableCoder.of(NaiveOrderBook.class);
 
@@ -404,8 +402,10 @@ public class TickerStreamTest {
     PCollection<NaiveOrderBook> o =
         p.apply("S1", stream)
             .apply(
-                TickerStream.<NaiveOrderBook>create(
-                    TickerStream.Mode.MULTIPLEX_STREAM, NaiveOrderBook.class))
+                TickerStream.<Tick, NaiveOrderBook>create(
+                    TickerStream.Mode.MULTIPLEX_STREAM,
+                    NaiveOrderBook.class,
+                    SerializableCoder.of(Tick.class)))
             .apply(Window.into(FixedWindows.of(TickerStream.BATCH_DURATION)));
 
     o.apply(Reify.windows()).apply(ParDo.of(new Print()));
@@ -437,6 +437,15 @@ public class TickerStreamTest {
               .setGlobalSequence(pc.element())
               .setId(s)
               .setOrder(new Order(s, 1.0, false, Order.TYPE.ADD)));
+    }
+  }
+
+  public static class GenerateKeys extends DoFn<Tick, KV<String, KV<Long, Tick>>> {
+
+    @ProcessElement
+    public void process(ProcessContext pc, @Element Tick tick) {
+
+      pc.output(KV.of(tick.getId(), KV.of(tick.getGlobalSequence(), tick)));
     }
   }
 }

@@ -26,7 +26,6 @@ import org.apache.beam.sdk.coders.BooleanCoder;
 import org.apache.beam.sdk.coders.CannotProvideCoderException;
 import org.apache.beam.sdk.coders.Coder;
 import org.apache.beam.sdk.coders.InstantCoder;
-import org.apache.beam.sdk.coders.SerializableCoder;
 import org.apache.beam.sdk.coders.VarLongCoder;
 import org.apache.beam.sdk.state.CombiningState;
 import org.apache.beam.sdk.state.MapState;
@@ -55,7 +54,6 @@ import org.apache.beam.sdk.values.KV;
 import org.apache.beam.sdk.values.PCollection;
 import org.apache.beam.sdk.values.PCollectionView;
 import org.apache.beam.sdk.values.TimestampedValue;
-import org.apache.beam.sdk.values.TypeDescriptor;
 import org.apache.beam.sdk.values.TypeDescriptors;
 import org.apache.beam.sdk.values.WindowingStrategy;
 import org.joda.time.Duration;
@@ -101,35 +99,45 @@ import org.slf4j.LoggerFactory;
 @AutoValue
 @Experimental
 @SuppressWarnings({"nullness", "TypeNameShadowing"})
-public abstract class TickerStream<V extends OrderBook>
-    extends PTransform<PCollection<Tick>, PCollection<V>> {
+public abstract class TickerStream<T, K extends MutableState<T>>
+    extends PTransform<PCollection<KV<Long, KV<String, T>>>, PCollection<K>> {
 
   public abstract Mode getMode();
 
-  public abstract Class<V> getOrderBookClazz();
+  public abstract Class<K> getMutableStateClazz();
+
+  public abstract Coder<T> getMutationCoder();
 
   @Nullable
   public abstract Long getEstimateFirstSeqNumSize();
 
-  public static <V extends OrderBook> TickerStream<V> create(Mode mode, Class<V> clazz) {
+  public static <T, V extends MutableState<T>> TickerStream<T, V> create(
+      Mode mode, Class<V> clazz, Coder<T> coder) {
 
     Preconditions.checkArgumentNotNull(mode, " Mode must be set.");
-    Preconditions.checkArgumentNotNull(clazz, " Class of Order Book must be set. Generics eh...");
+    Preconditions.checkArgumentNotNull(clazz, " Class of MutableSet must be set. Generics eh...");
+    Preconditions.checkArgumentNotNull(coder, " Coder of Mutation must be set. Generics eh...");
 
     assert !mode.equals(Mode.SIMPLEX_STREAM);
 
-    return new AutoValue_TickerStream.Builder<V>().setMode(mode).setOrderBookClazz(clazz).build();
+    return new AutoValue_TickerStream.Builder<T, V>()
+        .setMode(mode)
+        .setMutableStateClazz(clazz)
+        .setMutationCoder(coder)
+        .build();
   }
 
   @AutoValue.Builder
-  public abstract static class Builder<V extends OrderBook> {
-    public abstract Builder<V> setMode(Mode value);
+  public abstract static class Builder<T, K extends MutableState<T>> {
+    public abstract Builder<T, K> setMode(Mode value);
 
-    public abstract Builder<V> setOrderBookClazz(Class<V> value);
+    public abstract Builder<T, K> setMutableStateClazz(Class<K> value);
 
-    public abstract Builder<V> setEstimateFirstSeqNumSize(Long value);
+    public abstract Builder<T, K> setMutationCoder(Coder<T> value);
 
-    public abstract TickerStream<V> build();
+    public abstract Builder<T, K> setEstimateFirstSeqNumSize(Long value);
+
+    public abstract TickerStream<T, K> build();
   }
 
   // This value dictates how often the Sync event is broadcast
@@ -150,7 +158,7 @@ public abstract class TickerStream<V extends OrderBook>
   }
 
   @Override
-  public PCollection<V> expand(PCollection<Tick> input) {
+  public PCollection<K> expand(PCollection<KV<Long, KV<String, T>>> input) {
 
     // TODO reset window strategy
     setIncomingWindowStrategy(input.getWindowingStrategy());
@@ -165,28 +173,22 @@ public abstract class TickerStream<V extends OrderBook>
         input
             .apply(
                 "ApplyGlobalWindow",
-                Window.<Tick>into(new GlobalWindows())
+                Window.<KV<Long, KV<String, T>>>into(new GlobalWindows())
                     .triggering(Repeatedly.forever(AfterProcessingTime.pastFirstElementInPane()))
                     .discardingFiredPanes())
             .apply(
                 "MapToKV<1,Tick>",
                 MapElements.into(
                         TypeDescriptors.kvs(TypeDescriptors.integers(), TypeDescriptors.longs()))
-                    .via(x -> KV.of(1, x.getGlobalSequence())))
-            .apply(
-                "TrackGlobalSequence",
-                ParDo.of(
-                    GlobalSeqWM.<V>builder()
-                        .setTickerStream(this)
-                        .setBatchSize(TickerStream.BATCH_DURATION)
-                        .build()))
+                    .via(x -> KV.of(1, x.getKey())))
+            .apply("TrackGlobalSequence", ParDo.of(new GlobalSeqWM(TickerStream.BATCH_DURATION)))
             .apply(View.asIterable());
 
-    Coder<V> orderBookCoder = null;
+    Coder<K> orderBookCoder = null;
 
     // This will fail at Pipeline creation time.
     try {
-      orderBookCoder = input.getPipeline().getCoderRegistry().getCoder(getOrderBookClazz());
+      orderBookCoder = input.getPipeline().getCoderRegistry().getCoder(getMutableStateClazz());
     } catch (CannotProvideCoderException e) {
       throw new RuntimeException(e);
     }
@@ -195,12 +197,16 @@ public abstract class TickerStream<V extends OrderBook>
 
     return input
         .apply(
-            "MapToKV<String,Tick>",
-            MapElements.into(
-                    TypeDescriptors.kvs(TypeDescriptors.strings(), TypeDescriptor.of(Tick.class)))
-                .via(x -> KV.of(x.id, x)))
+            "MapToKV<String,Mutation>",
+            MapElements.<KV<String, KV<Long, T>>>into(
+                    TypeDescriptors.kvs(
+                        TypeDescriptors.strings(),
+                        TypeDescriptors.kvs(
+                            TypeDescriptors.longs(),
+                            getMutationCoder().getEncodedTypeDescriptor())))
+                .via(x -> KV.of(x.getValue().getKey(), KV.of(x.getKey(), x.getValue().getValue()))))
         .apply(
-            ParDo.of(new SymbolState<V>(this, orderBookCoder))
+            ParDo.of(new SymbolState<T, K>(this, orderBookCoder))
                 .withSideInput(TickerStream.SIDE_INPUT_NAME, i))
         .setCoder(orderBookCoder);
   }
@@ -210,23 +216,25 @@ public abstract class TickerStream<V extends OrderBook>
    *
    * <p>Input signal is {KV<Instant,Long>} which is a range of [0, LongValue)
    */
-  public static class SymbolState<T extends OrderBook> extends DoFn<KV<String, Tick>, T> {
+  public static class SymbolState<T, K extends MutableState<T>>
+      extends DoFn<KV<String, KV<Long, T>>, K> {
 
     // Config
-    private TickerStream<T> tickerStream;
+    private TickerStream<T, K> tickerStream;
 
     private static final Logger LOG = LoggerFactory.getLogger(SymbolState.class);
 
-    SymbolState(TickerStream<T> tickerStream, Coder<T> stateStateSpec) {
+    public SymbolState(TickerStream<T, K> tickerStream, Coder<K> stateStateSpec) {
+      Preconditions.checkArgumentNotNull(tickerStream);
       this.tickerStream = tickerStream;
       orderBook = StateSpecs.value(stateStateSpec);
+      buffer = StateSpecs.orderedList(tickerStream.getMutationCoder());
     }
 
     // Buffers Ticks until we get signal to release
     @DoFn.StateId("buffer")
     @SuppressWarnings("unused")
-    private final StateSpec<OrderedListState<Tick>> buffer =
-        StateSpecs.orderedList(SerializableCoder.of(Tick.class));
+    private final StateSpec<OrderedListState<T>> buffer;
 
     // SideInput used to store the release signals
     @DoFn.StateId("seqWMs")
@@ -237,7 +245,7 @@ public abstract class TickerStream<V extends OrderBook>
     // Order book object stored as Singleton
     @SuppressWarnings("unused")
     @DoFn.StateId("orderBook")
-    private final StateSpec<ValueState<T>> orderBook;
+    private final StateSpec<ValueState<K>> orderBook;
 
     @TimerFamily("mutate")
     @SuppressWarnings("unused")
@@ -247,16 +255,16 @@ public abstract class TickerStream<V extends OrderBook>
     public void process(
         @SideInput(TickerStream.SIDE_INPUT_NAME) Iterable<KV<Instant, Long>> seqWM,
         @StateId("seqWMs") MapState<Instant, Long> releaseSignals,
-        @StateId("buffer") OrderedListState<Tick> buffer,
+        @StateId("buffer") OrderedListState<T> buffer,
         @TimerFamily("mutate") TimerMap expiryTimers,
         @Timestamp Instant instant,
-        @Element KV<String, Tick> tick) {
+        @Element KV<String, KV<Long, T>> tick) {
 
       // Validation of Ticks will prevent error here
-      long sequence = tick.getValue().getGlobalSequence();
+      long sequence = tick.getValue().getKey();
 
       // Add elements to OrderedList, we do not do any processing @Process only in the EventTimer
-      buffer.add(TimestampedValue.of(tick.getValue(), Instant.ofEpochMilli(sequence)));
+      buffer.add(TimestampedValue.of(tick.getValue().getValue(), Instant.ofEpochMilli(sequence)));
       Iterator<KV<Instant, Long>> i = seqWM.iterator();
       while (i.hasNext()) {
         KV<Instant, Long> k = i.next();
@@ -269,11 +277,11 @@ public abstract class TickerStream<V extends OrderBook>
 
     @OnTimerFamily("mutate")
     public void onExpiry(
-        OutputReceiver<T> context,
+        OutputReceiver<K> context,
         OnTimerContext timerContext,
         @StateId("seqWMs") MapState<Instant, Long> seqWMs,
-        @StateId("orderBook") ValueState<T> orderBookState,
-        @StateId("buffer") OrderedListState<Tick> buffer) {
+        @StateId("orderBook") ValueState<K> orderBookState,
+        @StateId("buffer") OrderedListState<T> buffer) {
 
       // This should never be null, we can only be here if a value was set
       long releaseSignal = seqWMs.get(timerContext.timestamp()).read();
@@ -285,28 +293,29 @@ public abstract class TickerStream<V extends OrderBook>
           buffer.isEmpty().read());
 
       if (Boolean.FALSE.equals(buffer.isEmpty().read())) {
-        Iterable<TimestampedValue<Tick>> batch =
+        Iterable<TimestampedValue<T>> batch =
             buffer.readRange(Instant.EPOCH, Instant.ofEpochMilli(releaseSignal));
 
-        T orderBook;
+        K orderBook;
 
         try {
           orderBook =
               Optional.ofNullable(orderBookState.read())
-                  .orElse(tickerStream.getOrderBookClazz().getDeclaredConstructor().newInstance());
+                  .orElse(
+                      tickerStream.getMutableStateClazz().getDeclaredConstructor().newInstance());
         } catch (Exception e) {
           throw new RuntimeException(e);
         }
 
         int count = 0;
-        for (TimestampedValue<Tick> tickTimestampedValue : batch) {
-          Tick tick = tickTimestampedValue.getValue();
-          orderBook.add(tick.getOrder());
+        for (TimestampedValue<T> tickTimestampedValue : batch) {
+          T tick = tickTimestampedValue.getValue();
+          orderBook.mutate(tick);
           count++;
         }
 
         if (count > 0) {
-          LOG.trace("Outputting Order Book {} {}", timerContext.timestamp(), orderBook.getAsks());
+          LOG.trace("Outputting Order Book {} {}", timerContext.timestamp(), orderBook);
           context.outputWithTimestamp(orderBook, timerContext.timestamp());
           orderBookState.write(orderBook);
         }
@@ -319,27 +328,18 @@ public abstract class TickerStream<V extends OrderBook>
     }
   }
 
-  @AutoValue
-  public abstract static class GlobalSeqWM<T extends OrderBook>
-      extends DoFn<KV<Integer, Long>, KV<Instant, Long>> {
+  public static class GlobalSeqWM extends DoFn<KV<Integer, Long>, KV<Instant, Long>> {
 
     private static final Logger LOG = LoggerFactory.getLogger(GlobalSeqWM.class);
 
-    public abstract TickerStream<T> getTickerStream();
+    private Duration batchSize;
 
-    public abstract Duration getBatchSize();
-
-    public static <T extends OrderBook> GlobalSeqWM.Builder<T> builder() {
-      return new AutoValue_TickerStream_GlobalSeqWM.Builder<T>();
+    public Duration getBatchSize() {
+      return batchSize;
     }
 
-    @AutoValue.Builder
-    public abstract static class Builder<T extends OrderBook> {
-      public abstract Builder<T> setTickerStream(TickerStream<T> value);
-
-      public abstract Builder<T> setBatchSize(Duration value);
-
-      public abstract GlobalSeqWM<T> build();
+    public <T, K extends MutableState<T>> GlobalSeqWM(Duration batchSize) {
+      this.batchSize = batchSize;
     }
 
     @DoFn.StateId("buffer")
