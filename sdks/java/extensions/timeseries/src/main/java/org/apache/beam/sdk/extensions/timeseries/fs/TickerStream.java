@@ -95,6 +95,10 @@ import org.slf4j.LoggerFactory;
  * <p>Note the system will halt processing if a global sequence gap is detected.
  *
  * <p>Note currently the windowing strategy of the PCollection into the transform is not preserved.
+ *
+ * The input is expected to be in the format : KV<Long, KV<String, T>>
+ * The first Key is the GlobalSeqValue and the next key is the symbol.
+ *
  */
 @AutoValue
 @Experimental
