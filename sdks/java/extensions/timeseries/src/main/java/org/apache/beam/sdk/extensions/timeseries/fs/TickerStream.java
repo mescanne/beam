@@ -17,6 +17,8 @@
  */
 package org.apache.beam.sdk.extensions.timeseries.fs;
 
+import static org.apache.beam.sdk.util.Preconditions.checkArgumentNotNull;
+
 import com.google.auto.value.AutoValue;
 import java.util.Iterator;
 import java.util.Optional;
@@ -49,7 +51,6 @@ import org.apache.beam.sdk.transforms.windowing.AfterProcessingTime;
 import org.apache.beam.sdk.transforms.windowing.GlobalWindows;
 import org.apache.beam.sdk.transforms.windowing.Repeatedly;
 import org.apache.beam.sdk.transforms.windowing.Window;
-import org.apache.beam.sdk.util.Preconditions;
 import org.apache.beam.sdk.values.KV;
 import org.apache.beam.sdk.values.PCollection;
 import org.apache.beam.sdk.values.PCollectionView;
@@ -96,9 +97,8 @@ import org.slf4j.LoggerFactory;
  *
  * <p>Note currently the windowing strategy of the PCollection into the transform is not preserved.
  *
- * The input is expected to be in the format : KV<Long, KV<String, T>>
- * The first Key is the GlobalSeqValue and the next key is the symbol.
- *
+ * <p>The input is expected to be in the format : KV<Long, KV<String, T>> The first Key is the
+ * GlobalSeqValue and the next key is the symbol.
  */
 @AutoValue
 @Experimental
@@ -118,9 +118,9 @@ public abstract class TickerStream<T, K extends MutableState<T>>
   public static <T, V extends MutableState<T>> TickerStream<T, V> create(
       Mode mode, Class<V> clazz, Coder<T> coder) {
 
-    Preconditions.checkArgumentNotNull(mode, " Mode must be set.");
-    Preconditions.checkArgumentNotNull(clazz, " Class of MutableSet must be set. Generics eh...");
-    Preconditions.checkArgumentNotNull(coder, " Coder of Mutation must be set. Generics eh...");
+    checkArgumentNotNull(mode, "Mode must be set.");
+    checkArgumentNotNull(clazz, "Class of MutableSet must be set. Generics eh...");
+    checkArgumentNotNull(coder, "Coder of Mutation must be set. Generics eh...");
 
     assert !mode.equals(Mode.SIMPLEX_STREAM);
 
@@ -229,7 +229,7 @@ public abstract class TickerStream<T, K extends MutableState<T>>
     private static final Logger LOG = LoggerFactory.getLogger(SymbolState.class);
 
     public SymbolState(TickerStream<T, K> tickerStream, Coder<K> stateStateSpec) {
-      Preconditions.checkArgumentNotNull(tickerStream);
+      checkArgumentNotNull(tickerStream);
       this.tickerStream = tickerStream;
       orderBook = StateSpecs.value(stateStateSpec);
       buffer = StateSpecs.orderedList(tickerStream.getMutationCoder());

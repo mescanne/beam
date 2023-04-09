@@ -17,6 +17,9 @@
  */
 package org.apache.beam.sdk.extensions.timeseries.fs;
 
+import static org.joda.time.Duration.millis;
+import static org.joda.time.Duration.standardSeconds;
+
 import org.apache.beam.sdk.coders.InstantCoder;
 import org.apache.beam.sdk.coders.KvCoder;
 import org.apache.beam.sdk.coders.SerializableCoder;
@@ -50,6 +53,7 @@ import org.junit.Rule;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.junit.runners.JUnit4;
+import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 @RunWith(JUnit4.class)
@@ -72,46 +76,44 @@ public class TickerStreamTest {
         TestStream.create(VarLongCoder.of()).advanceWatermarkTo(START);
 
     for (long i = 0; i < 10; i++) {
-      stream = stream.addElements(i).advanceWatermarkTo(START.plus(Duration.standardSeconds(i)));
+      stream = stream.addElements(i).advanceWatermarkTo(START.plus(standardSeconds(i)));
     }
 
     PCollection<KV<Integer, Long>> ticks =
         p.apply(stream.advanceWatermarkToInfinity()).apply(WithKeys.of(1));
 
     PCollection<KV<Instant, Long>> output =
-        ticks.apply(ParDo.of(new TickerStream.GlobalSeqWM(Duration.standardSeconds(5))));
+        ticks.apply(ParDo.of(new TickerStream.GlobalSeqWM(standardSeconds(5))));
 
     PAssert.that(output)
         .containsInAnyOrder(
-            KV.of(START.plus(Duration.standardSeconds(5)), 6L),
-            KV.of(START.plus(Duration.standardSeconds(10)), 10L));
+            KV.of(START.plus(standardSeconds(5)), 6L), KV.of(START.plus(standardSeconds(10)), 10L));
 
     p.run();
   }
 
   @Test
-  public void lateData() throws NoSuchSchemaException {
+  public void lateData() {
 
     TestStream<KV<Integer, Long>> stream =
         TestStream.create(KvCoder.of(VarIntCoder.of(), VarLongCoder.of()))
             .advanceWatermarkTo(START)
             // Sequence is sent as 0,2,1 with 1 sent 10 mins after 2.
             .addElements(KV.of(1, 0L))
-            .advanceWatermarkTo(START.plus(Duration.standardSeconds(1)))
+            .advanceWatermarkTo(START.plus(standardSeconds(1)))
             .addElements(KV.of(1, 2L))
-            .advanceWatermarkTo(START.plus(Duration.standardSeconds(100)))
+            .advanceWatermarkTo(START.plus(standardSeconds(100)))
             .addElements(KV.of(1, 1L))
             .advanceWatermarkToInfinity();
 
     PCollection<KV<Integer, Long>> ticks = p.apply(stream);
 
     PCollection<KV<Instant, Long>> output =
-        ticks.apply(ParDo.of(new TickerStream.GlobalSeqWM(Duration.standardSeconds(5))));
+        ticks.apply(ParDo.of(new TickerStream.GlobalSeqWM(standardSeconds(5))));
 
     PAssert.that(output)
         .containsInAnyOrder(
-            KV.of(START.plus(Duration.standardSeconds(5)), 1L),
-            KV.of(START.plus(Duration.standardSeconds(105)), 3L));
+            KV.of(START.plus(standardSeconds(5)), 1L), KV.of(START.plus(standardSeconds(105)), 3L));
 
     p.run();
   }
@@ -124,21 +126,20 @@ public class TickerStreamTest {
             .advanceWatermarkTo(START)
             // Sequence is sent as 0,2,1 with 1 sent 10 mins after 2.
             .addElements(KV.of(1, 3L))
-            .advanceWatermarkTo(START.plus(Duration.standardSeconds(1)))
+            .advanceWatermarkTo(START.plus(standardSeconds(1)))
             .addElements(KV.of(1, 5L))
-            .advanceWatermarkTo(START.plus(Duration.standardSeconds(100)))
+            .advanceWatermarkTo(START.plus(standardSeconds(100)))
             .addElements(KV.of(1, 4L))
             .advanceWatermarkToInfinity();
 
     PCollection<KV<Integer, Long>> ticks = p.apply(stream);
 
     PCollection<KV<Instant, Long>> output =
-        ticks.apply(ParDo.of(new TickerStream.GlobalSeqWM(Duration.standardSeconds(5))));
+        ticks.apply(ParDo.of(new TickerStream.GlobalSeqWM(standardSeconds(5))));
 
     PAssert.that(output)
         .containsInAnyOrder(
-            KV.of(START.plus(Duration.standardSeconds(5)), 4L),
-            KV.of(START.plus(Duration.standardSeconds(105)), 6L));
+            KV.of(START.plus(standardSeconds(5)), 4L), KV.of(START.plus(standardSeconds(105)), 6L));
 
     p.run();
   }
@@ -149,8 +150,7 @@ public class TickerStreamTest {
     TestStream<KV<Instant, Long>> releaseMessage =
         TestStream.create(KvCoder.of(InstantCoder.of(), VarLongCoder.of()))
             .advanceWatermarkTo(START)
-            .addElements(
-                KV.of(START.plus(Duration.standardSeconds(5).minus(Duration.millis(1))), 1L))
+            .addElements(KV.of(START.plus(standardSeconds(5).minus(millis(1))), 1L))
             .advanceWatermarkToInfinity();
 
     Tick t0 =
@@ -176,9 +176,9 @@ public class TickerStreamTest {
             .advanceWatermarkTo(START)
             // Sequence is sent as 0,2,1 with 1 sent 10 mins after 2.
             .addElements(t0)
-            .advanceWatermarkTo(START.plus(Duration.standardSeconds(1)))
+            .advanceWatermarkTo(START.plus(standardSeconds(1)))
             .addElements(t2)
-            .advanceWatermarkTo(START.plus(Duration.standardSeconds(1)))
+            .advanceWatermarkTo(START.plus(standardSeconds(1)))
             .addElements(t1)
             .advanceWatermarkToInfinity();
 
@@ -217,10 +217,8 @@ public class TickerStreamTest {
     TestStream<KV<Instant, Long>> releaseMessage =
         TestStream.create(KvCoder.of(InstantCoder.of(), VarLongCoder.of()))
             .advanceWatermarkTo(START)
-            .addElements(
-                KV.of(START.plus(Duration.standardSeconds(5).minus(Duration.millis(1))), 1L))
-            .addElements(
-                KV.of(START.plus(Duration.standardSeconds(15).minus(Duration.millis(1))), 3L))
+            .addElements(KV.of(START.plus(standardSeconds(5).minus(millis(1))), 1L))
+            .addElements(KV.of(START.plus(standardSeconds(15).minus(millis(1))), 3L))
             .advanceWatermarkToInfinity();
 
     Tick t0 =
@@ -241,27 +239,24 @@ public class TickerStreamTest {
             .setId("G")
             .setOrder(new Order("G", 3.0, false, Order.TYPE.ADD));
 
+    // Sequence is sent as 0,2,1 with 1 sent 10 seconds after 2.
     TestStream<Tick> stream =
         TestStream.create(SerializableCoder.of(Tick.class))
             .advanceWatermarkTo(START)
-            // Sequence is sent as 0,2,1 with 1 sent 10 mins after 2.
             .addElements(t0)
-            .advanceWatermarkTo(START.plus(Duration.standardSeconds(5)).minus(Duration.millis(1)))
+            .advanceWatermarkTo(START.plus(standardSeconds(5)).minus(millis(1)))
             .addElements(t2)
-            .advanceWatermarkTo(START.plus(Duration.standardSeconds(15)).minus(Duration.millis(1)))
+            .advanceWatermarkTo(START.plus(standardSeconds(15)).minus(millis(1)))
             .addElements(t1)
             .advanceWatermarkToInfinity();
 
     NaiveOrderBook book0 = new NaiveOrderBook();
-
     book0.add(t0.getOrder());
 
     NaiveOrderBook book1 = new NaiveOrderBook();
-
     book1.add(t0.getOrder()).add(t1.getOrder());
 
     NaiveOrderBook book2 = new NaiveOrderBook();
-
     book2.add(t0.getOrder()).add(t1.getOrder()).add(t2.getOrder());
 
     PCollection<NaiveOrderBook> o =
@@ -292,8 +287,7 @@ public class TickerStreamTest {
         .inWindow(new IntervalWindow(START, START.plus(TickerStream.BATCH_DURATION)))
         .containsInAnyOrder(book0)
         .inWindow(
-            new IntervalWindow(
-                START.plus(Duration.standardSeconds(10)), START.plus(Duration.standardSeconds(15))))
+            new IntervalWindow(START.plus(standardSeconds(10)), START.plus(standardSeconds(15))))
         .containsInAnyOrder(book2);
     PAssert.that(o).containsInAnyOrder(book0, book2);
 
@@ -302,10 +296,11 @@ public class TickerStreamTest {
 
   static class Print extends DoFn<ValueInSingleWindow<NaiveOrderBook>, String> {
 
+    public static final Logger LOG = LoggerFactory.getLogger(TickerStreamTest.class);
+
     @ProcessElement
-    public void blah(ProcessContext pc) {
-      LoggerFactory.getLogger(TickerStreamTest.class)
-          .info("Contains: Window {} Value {}", pc.element().getWindow(), pc.element());
+    public void printElements(ProcessContext pc) {
+      LOG.info("Contains: Window {} Value {}", pc.element().getWindow(), pc.element());
     }
   }
 
@@ -318,18 +313,18 @@ public class TickerStreamTest {
             .advanceWatermarkTo(START)
             .addElements(KV.of(1, Long.MAX_VALUE - TickerStream.BATCH_DURATION.getMillis() - 2))
             .addElements(KV.of(1, Long.MAX_VALUE - TickerStream.BATCH_DURATION.getMillis() - 1))
-            .advanceWatermarkTo(START.plus(Duration.standardSeconds(1)))
+            .advanceWatermarkTo(START.plus(standardSeconds(1)))
             .advanceWatermarkToInfinity();
 
     PCollection<KV<Integer, Long>> ticks = p.apply(stream);
 
     PCollection<KV<Instant, Long>> output =
-        ticks.apply(ParDo.of(new TickerStream.GlobalSeqWM(Duration.standardSeconds(5))));
+        ticks.apply(ParDo.of(new TickerStream.GlobalSeqWM(standardSeconds(5))));
 
     PAssert.that(output)
         .containsInAnyOrder(
             KV.of(
-                START.plus(Duration.standardSeconds(5)),
+                START.plus(standardSeconds(5)),
                 Long.MAX_VALUE - TickerStream.BATCH_DURATION.getMillis()));
     p.run();
   }
@@ -374,9 +369,9 @@ public class TickerStreamTest {
                     KvCoder.of(StringUtf8Coder.of(), SerializableCoder.of(Tick.class))))
             .advanceWatermarkTo(START)
             .addElements(t0)
-            .advanceWatermarkTo(START.plus(Duration.standardSeconds(5)))
+            .advanceWatermarkTo(START.plus(standardSeconds(5)))
             .addElements(t2)
-            .advanceWatermarkTo(START.plus(Duration.standardSeconds(15)).minus(Duration.millis(1)))
+            .advanceWatermarkTo(START.plus(standardSeconds(15)).minus(millis(1)))
             .addElements(t1)
             .advanceWatermarkToInfinity();
 
@@ -414,12 +409,10 @@ public class TickerStreamTest {
     // [5,10)
     PAssert.that(o)
         .inWindow(
-            new IntervalWindow(
-                START.plus(Duration.standardSeconds(5)), START.plus(Duration.standardSeconds(10))))
+            new IntervalWindow(START.plus(standardSeconds(5)), START.plus(standardSeconds(10))))
         .containsInAnyOrder(book0)
         .inWindow(
-            new IntervalWindow(
-                START.plus(Duration.standardSeconds(15)), START.plus(Duration.standardSeconds(20))))
+            new IntervalWindow(START.plus(standardSeconds(15)), START.plus(standardSeconds(20))))
         .containsInAnyOrder(book2);
     PAssert.that(o).containsInAnyOrder(book0, book2);
 
@@ -430,7 +423,6 @@ public class TickerStreamTest {
 
     @ProcessElement
     public void process(ProcessContext pc, @Element Long id) {
-
       String s = id % 2 == 0 ? "G" : "A";
       pc.output(
           new Tick()
@@ -444,7 +436,6 @@ public class TickerStreamTest {
 
     @ProcessElement
     public void process(ProcessContext pc, @Element Tick tick) {
-
       pc.output(KV.of(tick.getId(), KV.of(tick.getGlobalSequence(), tick)));
     }
   }

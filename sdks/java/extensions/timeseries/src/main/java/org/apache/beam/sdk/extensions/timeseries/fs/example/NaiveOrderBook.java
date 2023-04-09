@@ -69,10 +69,7 @@ public class NaiveOrderBook extends OrderBook<Tick> implements Serializable {
     String id = modifiedOrder.getId();
     if (id != null) {
       Optional.ofNullable(getTree(originalOrder.isBid()).get(originalOrder.getValue()))
-          .ifPresent(
-              a -> {
-                a.remove(id);
-              });
+          .ifPresent(a -> a.remove(id));
       this.add(modifiedOrder);
     }
     return this;
@@ -97,11 +94,9 @@ public class NaiveOrderBook extends OrderBook<Tick> implements Serializable {
     if (this == o) {
       return true;
     }
-    ;
     if (!(o instanceof NaiveOrderBook)) {
       return false;
     }
-    ;
     NaiveOrderBook that = (NaiveOrderBook) o;
     //    LoggerFactory.getLogger(NaiveOrderBook.class).info("Compare! {} {}  ", asks, that.asks);
     return Objects.equals(bids, that.bids) && Objects.equals(asks, that.asks);

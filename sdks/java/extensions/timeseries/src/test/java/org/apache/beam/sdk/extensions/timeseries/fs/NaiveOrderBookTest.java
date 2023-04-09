@@ -17,6 +17,8 @@
  */
 package org.apache.beam.sdk.extensions.timeseries.fs;
 
+import static org.junit.Assert.assertEquals;
+
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.Map;
@@ -60,8 +62,8 @@ public class NaiveOrderBookTest {
     expected.put(1D, bid1);
     expected.put(2D, bid2);
 
-    Assert.assertEquals(expected, book.bids);
-    Assert.assertEquals(Optional.of(2.0), Optional.ofNullable(book.bids.firstKey()));
+    assertEquals(expected, book.bids);
+    assertEquals(Optional.of(2.0), Optional.ofNullable(book.bids.firstKey()));
   }
 
   @Test
@@ -83,8 +85,8 @@ public class NaiveOrderBookTest {
     expected.put(1.0, ask1);
     expected.put(2.0, ask2);
 
-    Assert.assertEquals(expected, book.asks);
-    Assert.assertEquals(Optional.of(1.0), Optional.ofNullable(book.asks.firstKey()));
+    assertEquals(expected, book.asks);
+    assertEquals(Optional.of(1.0), Optional.ofNullable(book.asks.firstKey()));
   }
 
   @Test
@@ -109,8 +111,8 @@ public class NaiveOrderBookTest {
     expected.put(1.0, bid1);
     expected.put(2.0, bid2);
 
-    Assert.assertEquals(expected, book.bids);
-    Assert.assertEquals(Optional.of(2.0), Optional.ofNullable(book.bids.firstKey()));
+    assertEquals(expected, book.bids);
+    assertEquals(Optional.of(2.0), Optional.ofNullable(book.bids.firstKey()));
   }
 
   @Test
@@ -136,7 +138,7 @@ public class NaiveOrderBookTest {
     expected.put(1.0, ask1);
     expected.put(2.0, ask2);
 
-    Assert.assertEquals(expected, book.asks);
-    Assert.assertEquals(Optional.of(1.0), Optional.ofNullable(book.asks.firstKey()));
+    assertEquals(expected, book.asks);
+    assertEquals(Optional.of(1.0), Optional.ofNullable(book.asks.firstKey()));
   }
 }

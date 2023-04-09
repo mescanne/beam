@@ -81,11 +81,9 @@ public class Order implements Serializable {
     if (this == o) {
       return true;
     }
-    ;
     if (!(o instanceof Order)) {
       return false;
     }
-    ;
     Order order = (Order) o;
     return bid == order.bid
         && Objects.equals(id, order.id)
