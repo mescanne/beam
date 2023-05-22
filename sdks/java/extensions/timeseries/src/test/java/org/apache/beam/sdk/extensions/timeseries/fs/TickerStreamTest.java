@@ -212,6 +212,77 @@ public class TickerStreamTest {
   }
 
   @Test
+  public void outOfOrderReleaseChecker() {
+
+    TestStream<KV<Instant, Long>> releaseMessage =
+        TestStream.create(KvCoder.of(InstantCoder.of(), VarLongCoder.of()))
+            .advanceWatermarkTo(START)
+            .addElements(
+                KV.of(START.plus(Duration.standardSeconds(5).minus(Duration.millis(1))), 1L))
+            .addElements(
+                KV.of(START.plus(Duration.standardSeconds(3).minus(Duration.millis(1))), 0L))
+            .advanceWatermarkTo(START.plus(Duration.standardSeconds(3)))
+            .advanceWatermarkToInfinity();
+
+    Tick t0 =
+        new Tick()
+            .setGlobalSequence(0L)
+            .setId("G")
+            .setOrder(new Order("G", 1.0, false, Order.TYPE.ADD));
+
+    Tick t1 =
+        new Tick()
+            .setGlobalSequence(1L)
+            .setId("G")
+            .setOrder(new Order("G", 1.0, false, Order.TYPE.ADD));
+
+    Tick t2 =
+        new Tick()
+            .setGlobalSequence(2L)
+            .setId("G")
+            .setOrder(new Order("G", 1.0, false, Order.TYPE.ADD));
+
+    TestStream<Tick> stream =
+        TestStream.create(SerializableCoder.of(Tick.class))
+            .advanceWatermarkTo(START)
+            // Sequence is sent as 0,2,1 with 1 sent 10 mins after 2.
+            .addElements(t0)
+            .advanceWatermarkTo(START.plus(Duration.standardSeconds(1)))
+            .addElements(t2)
+            .advanceWatermarkTo(START.plus(Duration.standardSeconds(1)))
+            .addElements(t1)
+            .advanceWatermarkToInfinity();
+
+    NaiveOrderBook book = new NaiveOrderBook();
+
+    book.add(t0.getOrder()).add(t1.getOrder()).add(t2.getOrder());
+
+    PCollection<NaiveOrderBook> o =
+        p.apply("S1", stream)
+            .apply(ParDo.of(new GenerateKeys()))
+            .apply(
+                ParDo.of(
+                        new TickerStream.SymbolState<>(
+                            CONFIG, SerializableCoder.of(NaiveOrderBook.class)))
+                    .withSideInput(
+                        TickerStream.SIDE_INPUT_NAME,
+                        p.apply("S2", releaseMessage)
+                            .apply(
+                                "Win1",
+                                Window.<KV<Instant, Long>>into(new GlobalWindows())
+                                    .triggering(
+                                        Repeatedly.forever(
+                                            AfterProcessingTime.pastFirstElementInPane()))
+                                    .withAllowedLateness(Duration.ZERO)
+                                    .discardingFiredPanes())
+                            .apply(View.asIterable())))
+            .setCoder(SerializableCoder.of(NaiveOrderBook.class));
+
+    PAssert.that(o).containsInAnyOrder(book);
+    p.run();
+  }
+
+  @Test
   public void completeReleaseChecker() {
 
     TestStream<KV<Instant, Long>> releaseMessage =

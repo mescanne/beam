@@ -20,7 +20,9 @@ package org.apache.beam.sdk.extensions.timeseries.fs;
 import static org.apache.beam.sdk.util.Preconditions.checkArgumentNotNull;
 
 import com.google.auto.value.AutoValue;
+import java.util.HashMap;
 import java.util.Iterator;
+import java.util.Map;
 import java.util.Optional;
 import javax.annotation.Nullable;
 import org.apache.beam.sdk.annotations.Experimental;
@@ -28,9 +30,9 @@ import org.apache.beam.sdk.coders.BooleanCoder;
 import org.apache.beam.sdk.coders.CannotProvideCoderException;
 import org.apache.beam.sdk.coders.Coder;
 import org.apache.beam.sdk.coders.InstantCoder;
+import org.apache.beam.sdk.coders.MapCoder;
 import org.apache.beam.sdk.coders.VarLongCoder;
 import org.apache.beam.sdk.state.CombiningState;
-import org.apache.beam.sdk.state.MapState;
 import org.apache.beam.sdk.state.OrderedListState;
 import org.apache.beam.sdk.state.StateSpec;
 import org.apache.beam.sdk.state.StateSpecs;
@@ -209,6 +211,7 @@ public abstract class TickerStream<T, K extends MutableState<T>>
                             TypeDescriptors.longs(),
                             getMutationCoder().getEncodedTypeDescriptor())))
                 .via(x -> KV.of(x.getValue().getKey(), KV.of(x.getKey(), x.getValue().getValue()))))
+        .apply("ApplyGlobalWindowMain", Window.into(new GlobalWindows()))
         .apply(
             ParDo.of(new SymbolState<T, K>(this, orderBookCoder))
                 .withSideInput(TickerStream.SIDE_INPUT_NAME, i))
@@ -241,60 +244,80 @@ public abstract class TickerStream<T, K extends MutableState<T>>
     private final StateSpec<OrderedListState<T>> buffer;
 
     // SideInput used to store the release signals
-    @DoFn.StateId("seqWMs")
+    @DoFn.StateId("releaseSignals")
     @SuppressWarnings("unused")
-    private final StateSpec<MapState<Instant, Long>> seqWMs =
-        StateSpecs.map(InstantCoder.of(), VarLongCoder.of());
+    private final StateSpec<ValueState<Map<Instant, Long>>> seqWMs =
+        StateSpecs.value(MapCoder.of(InstantCoder.of(), VarLongCoder.of()));
 
     // Order book object stored as Singleton
     @SuppressWarnings("unused")
     @DoFn.StateId("orderBook")
     private final StateSpec<ValueState<K>> orderBook;
 
-    @TimerFamily("mutate")
+    @TimerFamily("release")
     @SuppressWarnings("unused")
     private final TimerSpec expirySpec = TimerSpecs.timerMap(TimeDomain.EVENT_TIME);
 
+    // Buffers Ticks until we get signal to release
+    @DoFn.StateId("currSeq")
+    @SuppressWarnings("unused")
+    private final StateSpec<CombiningState<Long, long[], Long>> currSeq =
+        StateSpecs.combining(Max.ofLongs());
+
     @ProcessElement
     public void process(
-        @SideInput(TickerStream.SIDE_INPUT_NAME) Iterable<KV<Instant, Long>> seqWM,
-        @StateId("seqWMs") MapState<Instant, Long> releaseSignals,
+        @SideInput(TickerStream.SIDE_INPUT_NAME) Iterable<KV<Instant, Long>> sideInputSignals,
+        @StateId("releaseSignals") ValueState<Map<Instant, Long>> releaseSignals,
         @StateId("buffer") OrderedListState<T> buffer,
-        @TimerFamily("mutate") TimerMap expiryTimers,
-        @Timestamp Instant instant,
+        @StateId("currSeq") CombiningState<Long, long[], Long> currSeq,
+        @TimerFamily("release") TimerMap expiryTimers,
         @Element KV<String, KV<Long, T>> tick) {
 
-      // Validation of Ticks will prevent error here
+      // TODO Validation of Ticks in expand will prevent NPE error here
       long sequence = tick.getValue().getKey();
 
       // Add elements to OrderedList, we do not do any processing @Process only in the EventTimer
       buffer.add(TimestampedValue.of(tick.getValue().getValue(), Instant.ofEpochMilli(sequence)));
-      Iterator<KV<Instant, Long>> i = seqWM.iterator();
-      while (i.hasNext()) {
-        KV<Instant, Long> k = i.next();
-        releaseSignals.put(k.getKey(), k.getValue());
-        // Set timer for Release time
-        expiryTimers.set(String.valueOf(k.getKey().getMillis()), k.getKey());
-        LOG.trace("Setting Release Timers in key {} to {}", tick.getKey(), k.getKey());
+
+      Map<Instant, Long> signals = new HashMap<>();
+
+      boolean newTriggers = false;
+      for (KV<Instant, Long> k : sideInputSignals) {
+        if (k.getValue() > currSeq.read()) {
+          newTriggers = true;
+          signals.put(k.getKey(), k.getValue());
+          // Set timer for Release time
+          expiryTimers.set(String.valueOf(k.getKey().getMillis()), k.getKey());
+          currSeq.add(k.getValue());
+          releaseSignals.write(signals);
+        }
+      }
+      if (newTriggers) {
+        signals.putAll(releaseSignals.read());
+        releaseSignals.write(signals);
       }
     }
 
-    @OnTimerFamily("mutate")
-    public void onExpiry(
+    @OnTimerFamily("release")
+    public void onRelease(
         OutputReceiver<K> context,
         OnTimerContext timerContext,
-        @StateId("seqWMs") MapState<Instant, Long> seqWMs,
+        @Key String key,
+        @StateId("releaseSignals") ValueState<Map<Instant, Long>> releaseSignals,
         @StateId("orderBook") ValueState<K> orderBookState,
         @StateId("buffer") OrderedListState<T> buffer) {
 
       // This should never be null, we can only be here if a value was set
-      long releaseSignal = seqWMs.get(timerContext.timestamp()).read();
+      Map<Instant, Long> signals = releaseSignals.read();
 
       LOG.trace(
-          "OnTimer Time {} release {} batch {}",
+          "Lets get all values - key {} - {} - {} - {} ",
+          key,
+          signals.isEmpty(),
           timerContext.timestamp(),
-          releaseSignal,
-          buffer.isEmpty().read());
+          signals.get(timerContext.timestamp()));
+
+      long releaseSignal = signals.get(timerContext.timestamp());
 
       if (Boolean.FALSE.equals(buffer.isEmpty().read())) {
         Iterable<TimestampedValue<T>> batch =
@@ -319,7 +342,6 @@ public abstract class TickerStream<T, K extends MutableState<T>>
         }
 
         if (count > 0) {
-          LOG.trace("Outputting Order Book {} {}", timerContext.timestamp(), orderBook);
           context.outputWithTimestamp(orderBook, timerContext.timestamp());
           orderBookState.write(orderBook);
         }
@@ -327,7 +349,8 @@ public abstract class TickerStream<T, K extends MutableState<T>>
         // Note Range is [0, releaseSignal)
         buffer.clearRange(Instant.EPOCH, Instant.ofEpochMilli(releaseSignal));
         // Clear TimerMapValue
-        seqWMs.remove(timerContext.timestamp());
+        signals.remove(timerContext.timestamp());
+        releaseSignals.write(signals);
       }
     }
   }
@@ -454,6 +477,7 @@ public abstract class TickerStream<T, K extends MutableState<T>>
 
         if (lastSeq != seqWM) {
           context.output(KV.of(timerContext.timestamp(), lastSeq + 1));
+          LOG.info("Releasing global watermark based on contiguous output to {}", lastSeq);
         }
 
         buffer.clearRange(
@@ -472,6 +496,9 @@ public abstract class TickerStream<T, K extends MutableState<T>>
           timer
               .withOutputTimestamp(timerContext.timestamp().plus(getBatchSize()))
               .set(timerContext.timestamp().plus(getBatchSize()));
+          LOG.info(
+              "Setting a new Timer from existing timer which fired at {}",
+              timerContext.timestamp());
         }
       }
     }

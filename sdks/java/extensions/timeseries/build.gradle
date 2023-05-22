@@ -33,9 +33,11 @@ dependencies {
   implementation library.java.joda_time
   implementation project(path: ":sdks:java:core", configuration: "shadow")
   implementation 'org.slf4j:slf4j-api:1.7.30'
-
   testImplementation library.java.junit
-  testRuntimeOnly project(path: ":runners:direct-java", configuration: "shadow")
   testRuntimeOnly library.java.slf4j_api
   testRuntimeOnly library.java.slf4j_jdk14
+  testRuntimeOnly project(path: ":runners:direct-java", configuration: "shadow")
+  testImplementation project(":sdks:java:io:google-cloud-platform")
+  testImplementation project(":sdks:java:extensions:google-cloud-platform-core")
+  testImplementation project(":runners:google-cloud-dataflow-java")
 }
