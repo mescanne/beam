@@ -114,15 +114,18 @@ public abstract class TickerStream<T, K extends MutableState<T>>
 
   public abstract Coder<T> getMutationCoder();
 
+  public abstract Boolean getContinuousStream();
+
   @Nullable
   public abstract Long getEstimateFirstSeqNumSize();
 
   public static <T, V extends MutableState<T>> TickerStream<T, V> create(
-      Mode mode, Class<V> clazz, Coder<T> coder) {
+      Mode mode, Class<V> clazz, Coder<T> coder, Boolean continuousStream) {
 
     checkArgumentNotNull(mode, "Mode must be set.");
     checkArgumentNotNull(clazz, "Class of MutableSet must be set. Generics eh...");
     checkArgumentNotNull(coder, "Coder of Mutation must be set. Generics eh...");
+    checkArgumentNotNull(continuousStream, "Continous stream must be set.");
 
     assert !mode.equals(Mode.SIMPLEX_STREAM);
 
@@ -130,6 +133,7 @@ public abstract class TickerStream<T, K extends MutableState<T>>
         .setMode(mode)
         .setMutableStateClazz(clazz)
         .setMutationCoder(coder)
+        .setContinuousStream(continuousStream)
         .build();
   }
 
@@ -142,6 +146,8 @@ public abstract class TickerStream<T, K extends MutableState<T>>
     public abstract Builder<T, K> setMutationCoder(Coder<T> value);
 
     public abstract Builder<T, K> setEstimateFirstSeqNumSize(Long value);
+
+    public abstract Builder<T, K> setContinuousStream(Boolean value);
 
     public abstract TickerStream<T, K> build();
   }
@@ -338,11 +344,16 @@ public abstract class TickerStream<T, K extends MutableState<T>>
         for (TimestampedValue<T> tickTimestampedValue : batch) {
           T tick = tickTimestampedValue.getValue();
           orderBook.mutate(tick);
+          if (tickerStream.getContinuousStream()) {
+            context.outputWithTimestamp(orderBook, tickTimestampedValue.getTimestamp());
+          }
           count++;
         }
 
         if (count > 0) {
-          context.outputWithTimestamp(orderBook, timerContext.timestamp());
+          if (!tickerStream.getContinuousStream()) {
+            context.outputWithTimestamp(orderBook, timerContext.timestamp());
+          }
           orderBookState.write(orderBook);
         }
 
