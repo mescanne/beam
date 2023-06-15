@@ -29,7 +29,6 @@ import org.apache.beam.sdk.coders.VarLongCoder;
 import org.apache.beam.sdk.extensions.timeseries.fs.example.NaiveOrderBook;
 import org.apache.beam.sdk.extensions.timeseries.fs.example.Order;
 import org.apache.beam.sdk.extensions.timeseries.fs.example.Tick;
-import org.apache.beam.sdk.schemas.NoSuchSchemaException;
 import org.apache.beam.sdk.testing.PAssert;
 import org.apache.beam.sdk.testing.TestPipeline;
 import org.apache.beam.sdk.testing.TestStream;
@@ -65,7 +64,8 @@ public class TickerStreamTest {
       TickerStream.create(
           TickerStream.Mode.MULTIPLEX_STREAM,
           NaiveOrderBook.class,
-          SerializableCoder.of(Tick.class));
+          SerializableCoder.of(Tick.class),
+          false);
 
   @Rule public final transient TestPipeline p = TestPipeline.create();
 
@@ -367,7 +367,7 @@ public class TickerStreamTest {
 
   static class Print extends DoFn<ValueInSingleWindow<NaiveOrderBook>, String> {
 
-    public static final Logger LOG = LoggerFactory.getLogger(TickerStreamTest.class);
+    private static final Logger LOG = LoggerFactory.getLogger(TickerStreamTest.class);
 
     @ProcessElement
     public void printElements(ProcessContext pc) {
@@ -471,7 +471,8 @@ public class TickerStreamTest {
                 TickerStream.<Tick, NaiveOrderBook>create(
                     TickerStream.Mode.MULTIPLEX_STREAM,
                     NaiveOrderBook.class,
-                    SerializableCoder.of(Tick.class)))
+                    SerializableCoder.of(Tick.class),
+                    false))
             .apply(Window.into(FixedWindows.of(TickerStream.BATCH_DURATION)));
 
     o.apply(Reify.windows()).apply(ParDo.of(new Print()));
@@ -509,5 +510,56 @@ public class TickerStreamTest {
     public void process(ProcessContext pc, @Element Tick tick) {
       pc.output(KV.of(tick.getId(), KV.of(tick.getGlobalSequence(), tick)));
     }
+  }
+
+  public static class MutableX extends MutableState<Long> implements Serializable {
+    private final StringBuilder sb = new StringBuilder();
+
+    @Override
+    public void mutate(Long mutation) {
+      sb.append(Long.toString(mutation));
+    }
+
+    public String toString() {
+      return sb.toString();
+    }
+  }
+
+  // This was required for the old TickerStream (without generic output type)
+  public static class ConvertMutableXToString extends DoFn<MutableX, String> {
+    @ProcessElement
+    public void process(ProcessContext processContext, @Element MutableX element) {
+      processContext.output(element.toString());
+    }
+  }
+
+  @Test
+  public void testMutationProcessor() {
+
+    PCollection<KV<Long, KV<String, Long>>> input =
+        p.apply(
+            Create.of(
+                Arrays.asList(
+                    KV.of(1L, KV.of("A", 1L)),
+                    KV.of(3L, KV.of("A", 3L)),
+                    KV.of(4L, KV.of("A", 4L)),
+                    KV.of(2L, KV.of("A", 2L)),
+                    KV.of(5L, KV.of("A", 5L)))));
+
+    // Create a continuous tick stream
+    TickerStream<Long, MutableX> ts =
+        TickerStream.<Long, MutableX>create(
+            TickerStream.Mode.MULTIPLEX_STREAM,
+            MutableX.class,
+            SerializableCoder.of(Long.class),
+            true);
+
+    // Apply to the input and convert output to strings
+    PCollection<String> output = input.apply(ts).apply(ParDo.of(new ConvertMutableXToString()));
+
+    // Expect all strings are appended together in the correct order
+    PAssert.that(output).containsInAnyOrder("1", "12", "123", "12345", "1234");
+
+    p.run().waitUntilFinish();
   }
 }
